@@ -15,6 +15,9 @@ Websocket is then used to update the frontend
 from ultralytics import YOLO
 import cv2
 import multiprocessing as mp
+import time
+import asyncio
+import websockets
 
 # Load the YOLO model
 model = YOLO("yolo11n.pt")
@@ -109,7 +112,8 @@ Displays processed frames in a window named after the source
 Allows quitting playback by pressing 'q'
 Cleans up by releasing capture and closing windows when done
 """
-def process_video(source):
+async def process_video(source):
+    updated_tables = []
     cap = cv2.VideoCapture(source)
     while cap.isOpened():
         ret, frame = cap.read()
@@ -122,18 +126,28 @@ def process_video(source):
         
         cv2.imshow(f"Video {source}", bounded) # Display the results
         
+        # Update the final table values every five minutes (may or may not be needed)
+        if time.time() % 300 == 0:
+            updated_tables = output
+            
         print(output)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     cap.release()
     cv2.destroyAllWindows()
+    
+    info = 0 #TODO: This is a temporary placeholder where info will contain the information needed to update the database
+    
+    await websockets.send(info) # Do we need this to send the info through the database consistently?
 
-# Main function to perform the required tasks
-if __name__ == "__main__":
+
+# Used to send the info through the websocket
+# It would also start the multithreading process
+async def data_input(websocket, info):
     sources = [0]  # List of video sources to process (The default is zero which will attempt to use the computer webcam)
     processes = []
-
+    
     # Processes the information in each stream
     for src in sources:
         p = mp.Process(target=process_video, args=(src,))
@@ -143,6 +157,16 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
+# Used to open the websocket
+async def socket():
+    async with websockets.serve(data_input, "localhost", 8765):
+        await asyncio.Future() # This will run forever
+        
 
-
-# Process the video
+# Main function to perform the required tasks
+if __name__ == "__main__":
+    
+    asyncio.run(socket())
+        
+    # One websocket to be open and continually send updated data into the database
+    # in that case the different threads may need to be included in the websocket function
