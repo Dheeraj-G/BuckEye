@@ -18,9 +18,14 @@ import multiprocessing as mp
 import time
 import asyncio
 import websockets
+import json
+from multiprocessing import Queue
 
 # Load the YOLO model
 model = YOLO("yolo11n.pt")
+
+# Create a queue for inter-process communication
+message_queue = Queue()
 
 # Calculate Intersection over Union (IoU) between two boxes.
 def iou(box1, box2):
@@ -102,71 +107,83 @@ def yolo_process(frame):
     
     return (frame, output)
 
-
-"""
-Function to process video from a given source (webcam or video file)
-Takes a source parameter which can be a webcam index (0) or video file path
-Opens video capture, reads frames continuously until video ends
-Converts each frame to grayscale for processing
-Displays processed frames in a window named after the source
-Allows quitting playback by pressing 'q'
-Cleans up by releasing capture and closing windows when done
-"""
-async def process_video(source):
-    updated_tables = []
+def process_video(source, queue):
+    """Process video from a single source and put results in the queue"""
     cap = cv2.VideoCapture(source)
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         
-        # It seems that yolo is trained on rgb images so the use of grayscaled images would not be useful
+        bounded, output = yolo_process(frame)
         
-        bounded, output = yolo_process(frame) # Process the frame through yolov11
+        # Put data in queue for websocket transmission
+        data = {
+            'timestamp': time.time(),
+            'source': source,
+            'table_status': output
+        }
+        queue.put(data)
         
-        cv2.imshow(f"Video {source}", bounded) # Display the results
-        
-        # Update the final table values every five minutes (may or may not be needed)
-        if time.time() % 300 == 0:
-            updated_tables = output
-            
-        print(output)
+        cv2.imshow(f"Video {source}", bounded)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+            
     cap.release()
     cv2.destroyAllWindows()
-    
-    info = 0 #TODO: This is a temporary placeholder where info will contain the information needed to update the database
-    
-    await websockets.send(info) # Do we need this to send the info through the database consistently?
 
+async def websocket_sender(websocket, queue):
+    """Continuously send data from queue through websocket"""
+    try:
+        while True:
+            if not queue.empty():
+                data = queue.get()
+                try:
+                    await websocket.send(json.dumps(data))
+                except websockets.exceptions.ConnectionClosed:
+                    print("Websocket connection closed")
+                    break
+            await asyncio.sleep(0.01)  # Small delay to prevent CPU overuse
+    except Exception as e:
+        print(f"Error in websocket sender: {e}")
 
-# Used to send the info through the websocket
-# It would also start the multithreading process
-async def data_input(websocket, info):
-    sources = [0]  # List of video sources to process (The default is zero which will attempt to use the computer webcam)
-    processes = []
-    
-    # Processes the information in each stream
-    for src in sources:
-        p = mp.Process(target=process_video, args=(src,))
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
-
-# Used to open the websocket
-async def socket():
-    async with websockets.serve(data_input, "localhost", 8765):
-        await asyncio.Future() # This will run forever
+async def handle_connection(websocket):
+    """Handle a single websocket connection"""
+    try:
+        # Send initial connection message
+        await websocket.send(json.dumps({"status": "connected"}))
         
+        # Start video processing in separate processes
+        processes = []
+        sources = [0, 1]  # List of video sources
+        
+        for src in sources:
+            p = mp.Process(target=process_video, args=(src, message_queue))
+            p.start()
+            processes.append(p)
+        
+        # Start websocket sender
+        await websocket_sender(websocket, message_queue)
+        
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected")
+    except Exception as e:
+        print(f"Error occurred: {e}")
+    finally:
+        # Cleanup processes
+        for p in processes:
+            p.terminate()
+            p.join()
 
-# Main function to perform the required tasks
+async def main():
+    """Main function to start websocket server"""
+    async with websockets.serve(handle_connection, "localhost", 8765):
+        print("WebSocket server started at ws://localhost:8765")
+        await asyncio.Future()  # run forever
+
 if __name__ == "__main__":
-    
-    asyncio.run(socket())
+    asyncio.run(main())
         
     # One websocket to be open and continually send updated data into the database
     # in that case the different threads may need to be included in the websocket function
